@@ -1,0 +1,340 @@
+/* =========================================================
+   BASES DE DATOS 2 - OBLIGATORIO 2 - 2026
+   Programa en C con SQL embebido (ECPG) - lab02.pgc
+
+   Compilar:
+       ecpg lab02.pgc
+       gcc -c lab02.c -I$(pg_config --includedir)
+       gcc -o lab02 lab02.o -L$(pg_config --libdir) -lecpg
+
+   Ejecutar:
+       ./lab02
+   ========================================================= */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+EXEC SQL INCLUDE sqlca;
+
+/* Variables de conexión y manejo de errores */
+EXEC SQL WHENEVER SQLERROR CONTINUE;
+EXEC SQL WHENEVER NOT FOUND CONTINUE;
+
+static void chequear_error(const char *accion)
+{
+    if (sqlca.sqlcode < 0)
+    {
+        printf("\n*** ERROR en %s ***\n", accion);
+        printf("SQLCODE: %ld\n", sqlca.sqlcode);
+        printf("Mensaje : %s\n", sqlca.sqlerrm.sqlerrmc);
+        printf("**************************\n");
+    }
+}
+
+static void limpiar_buffer(void)
+{
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) {}
+}
+
+/* ---------------------------------------------------------
+   OPCION 1: lotes pendientes de inspección o reinspección
+   --------------------------------------------------------- */
+static void listar_lotes_pendientes(void)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        int   v_id_lote;
+        char  v_proveedor[51];
+        char  v_fecha_recepcion[11];
+    EXEC SQL END DECLARE SECTION;
+
+    printf("\n=== LOTES PENDIENTES DE INSPECCION / REINSPECCION ===\n");
+    printf("%-8s %-25s %-15s\n", "Lote", "Proveedor", "Fecha Recep.");
+    printf("---------------------------------------------------------\n");
+
+    EXEC SQL DECLARE cur_pendientes CURSOR FOR
+        SELECT id_lote, proveedor, fecha_recepcion::text
+          FROM fn_lotes_pendientes();
+
+    EXEC SQL OPEN cur_pendientes;
+    chequear_error("abrir cursor de lotes pendientes");
+
+    while (1)
+    {
+        EXEC SQL FETCH cur_pendientes INTO :v_id_lote, :v_proveedor, :v_fecha_recepcion;
+
+        if (sqlca.sqlcode == 100) /* NOT FOUND */
+            break;
+
+        chequear_error("recorrer lotes pendientes");
+
+        printf("%-8d %-25s %-15s\n", v_id_lote, v_proveedor, v_fecha_recepcion);
+    }
+
+    EXEC SQL CLOSE cur_pendientes;
+}
+
+/* ---------------------------------------------------------
+   OPCION 2: registrar control de calidad de un lote
+   --------------------------------------------------------- */
+static void registrar_control(void)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        int    v_id_lote;
+        char   v_fecha[11];
+        char   v_hora[9];
+        int    v_id_tipo;
+        double v_medida;
+        short  v_medida_ind;
+        char   v_unidad[51];
+        short  v_unidad_ind;
+        char   v_integridad[21];
+        short  v_integridad_ind;
+        char   v_observacion[201];
+        int    v_id_empleado;
+        char   v_motivo[201];
+        short  v_motivo_ind;
+        char   v_accion[21];
+        short  v_accion_ind;
+
+        int    v_out_id_control;
+        char   v_out_estado_control[21];
+        char   v_out_estado_lote[21];
+    EXEC SQL END DECLARE SECTION;
+
+    char opt;
+    char buffer[256];
+
+    printf("\n=== REGISTRAR CONTROL DE CALIDAD ===\n");
+
+    printf("Identificador del lote inspeccionado: ");
+    scanf("%d", &v_id_lote);
+    limpiar_buffer();
+
+    printf("Fecha del control (AAAA-MM-DD): ");
+    scanf("%10s", v_fecha);
+    limpiar_buffer();
+
+    printf("Hora del control (HH:MM:SS): ");
+    scanf("%8s", v_hora);
+    limpiar_buffer();
+
+    printf("Id. del tipo de control (consulte tabla tipo_control): ");
+    scanf("%d", &v_id_tipo);
+    limpiar_buffer();
+
+    printf("Es un control cuantitativo? (s/n): ");
+    scanf(" %c", &opt);
+    limpiar_buffer();
+
+    if (opt == 's' || opt == 'S')
+    {
+        printf("Valor observado (medida): ");
+        scanf("%lf", &v_medida);
+        limpiar_buffer();
+        v_medida_ind = 0;
+
+        printf("Unidad de medida: ");
+        fgets(v_unidad, sizeof(v_unidad), stdin);
+        v_unidad[strcspn(v_unidad, "\n")] = '\0';
+        v_unidad_ind = 0;
+
+        v_integridad_ind = -1; /* NULL */
+    }
+    else
+    {
+        v_medida_ind = -1; /* NULL */
+        v_unidad_ind = -1; /* NULL */
+
+        printf("Integridad del envase/empaquetado\n");
+        printf("  (excelente / normal / con da\xc3\xb1os / inaceptable)\n");
+        printf("o ENTER si no aplica a este control: ");
+        fgets(v_integridad, sizeof(v_integridad), stdin);
+        v_integridad[strcspn(v_integridad, "\n")] = '\0';
+
+        if (strlen(v_integridad) == 0)
+            v_integridad_ind = -1;
+        else
+            v_integridad_ind = 0;
+    }
+
+    printf("Observaciones: ");
+    fgets(v_observacion, sizeof(v_observacion), stdin);
+    v_observacion[strcspn(v_observacion, "\n")] = '\0';
+
+    printf("Id. del funcionario/inspector que realiza el control: ");
+    scanf("%d", &v_id_empleado);
+    limpiar_buffer();
+
+    v_out_id_control = 0;
+    strcpy(v_out_estado_control, "");
+    strcpy(v_out_estado_lote, "");
+
+    /* El motivo y la accion sobre el lote se solicitan recien
+       despues de conocer si el lote quedo rechazado, pero como el
+       calculo ocurre dentro del procedimiento, se piden ahora de
+       forma condicional: si el control resulta ser RECHAZADO, el
+       sistema vuelve a preguntar antes de confirmar (ver mas abajo).
+       Para simplificar la demo, se solicitan siempre y se ignoran
+       si no corresponden. */
+    printf("Si el lote resultara RECHAZADO, motivo de rechazo (ENTER si no aplica): ");
+    fgets(v_motivo, sizeof(v_motivo), stdin);
+    v_motivo[strcspn(v_motivo, "\n")] = '\0';
+    v_motivo_ind = (strlen(v_motivo) == 0) ? -1 : 0;
+
+    printf("Si el lote resultara RECHAZADO, accion (DEVUELTO/DESCARTADO, ENTER si no aplica): ");
+    fgets(v_accion, sizeof(v_accion), stdin);
+    v_accion[strcspn(v_accion, "\n")] = '\0';
+    v_accion_ind = (strlen(v_accion) == 0) ? -1 : 0;
+
+    EXEC SQL CALL sp_registrar_control(
+        :v_id_lote, :v_fecha, :v_hora, :v_id_tipo,
+        :v_medida :v_medida_ind,
+        :v_unidad :v_unidad_ind,
+        :v_integridad :v_integridad_ind,
+        :v_observacion,
+        :v_id_empleado,
+        :v_motivo :v_motivo_ind,
+        :v_accion :v_accion_ind,
+        :v_out_id_control, :v_out_estado_control, :v_out_estado_lote
+    );
+
+    chequear_error("registrar control de calidad");
+
+    if (sqlca.sqlcode >= 0)
+    {
+        printf("\nControl registrado correctamente. Id. control: %d\n", v_out_id_control);
+        printf("Estado del control: %s\n", v_out_estado_control);
+        printf("Estado actual del lote: %s\n", v_out_estado_lote);
+
+        if (strcmp(v_out_estado_lote, "OBSERVADO") == 0)
+            printf("=> El lote queda OBSERVADO y requiere una reinspeccion posterior.\n");
+        else if (strcmp(v_out_estado_lote, "RECHAZADO") == 0)
+            printf("=> El lote queda RECHAZADO. Verifique que se haya registrado el motivo.\n");
+
+        EXEC SQL COMMIT;
+    }
+    else
+    {
+        EXEC SQL ROLLBACK;
+    }
+}
+
+/* ---------------------------------------------------------
+   OPCION 3: reporte de controles por empleado en un rango
+   de fechas
+   --------------------------------------------------------- */
+static void reporte_controles_empleado(void)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char v_fecha_ini[11];
+        char v_fecha_fin[11];
+        int  v_id_empleado;
+        char v_nombre[101];
+        long v_aprobados;
+        long v_rechazados;
+        long v_observados;
+    EXEC SQL END DECLARE SECTION;
+
+    printf("\n=== REPORTE DE CONTROLES POR EMPLEADO ===\n");
+    printf("Fecha inicial (AAAA-MM-DD): ");
+    scanf("%10s", v_fecha_ini);
+    limpiar_buffer();
+
+    printf("Fecha final (AAAA-MM-DD): ");
+    scanf("%10s", v_fecha_fin);
+    limpiar_buffer();
+
+    printf("\n%-5s %-25s %-10s %-10s %-10s\n",
+           "Id.", "Empleado", "Aprob.", "Rechaz.", "Observ.");
+    printf("--------------------------------------------------------------\n");
+
+    EXEC SQL DECLARE cur_reporte CURSOR FOR
+        SELECT id_empleado, empleado, aprobados, rechazados, observados
+          FROM fn_reporte_controles_empleado(:v_fecha_ini, :v_fecha_fin);
+
+    EXEC SQL OPEN cur_reporte;
+    chequear_error("abrir cursor de reporte");
+
+    while (1)
+    {
+        EXEC SQL FETCH cur_reporte
+            INTO :v_id_empleado, :v_nombre, :v_aprobados, :v_rechazados, :v_observados;
+
+        if (sqlca.sqlcode == 100)
+            break;
+
+        chequear_error("recorrer reporte de controles");
+
+        printf("%-5d %-25s %-10ld %-10ld %-10ld\n",
+               v_id_empleado, v_nombre, v_aprobados, v_rechazados, v_observados);
+    }
+
+    EXEC SQL CLOSE cur_reporte;
+}
+
+/* ---------------------------------------------------------
+   MAIN: conexión, menú y desconexión
+   --------------------------------------------------------- */
+int main(void)
+{
+    int opcion;
+
+    /* Ajustar usuario / password / host segun corresponda */
+    EXEC SQL CONNECT TO lab02 USER inspector USING 'inspector123';
+
+    if (sqlca.sqlcode != 0)
+    {
+        printf("No fue posible conectarse a la base de datos lab02.\n");
+        printf("SQLCODE: %ld - %s\n", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        return EXIT_FAILURE;
+    }
+
+    printf("Conexion establecida con la base de datos lab02.\n");
+
+    do
+    {
+        printf("\n--------------------------------------\n");
+        printf("   SISTEMA DE CONTROL DE CALIDAD\n");
+        printf("--------------------------------------\n");
+        printf("1. Listar lotes pendientes de inspeccion/reinspeccion\n");
+        printf("2. Registrar control de calidad de un lote\n");
+        printf("3. Reporte de controles por empleado\n");
+        printf("0. Salir\n");
+        printf("--------------------------------------\n");
+        printf("Ingrese una opcion: ");
+
+        if (scanf("%d", &opcion) != 1)
+        {
+            limpiar_buffer();
+            opcion = -1;
+            printf("Opcion invalida.\n");
+            continue;
+        }
+        limpiar_buffer();
+
+        switch (opcion)
+        {
+            case 1:
+                listar_lotes_pendientes();
+                break;
+            case 2:
+                registrar_control();
+                break;
+            case 3:
+                reporte_controles_empleado();
+                break;
+            case 0:
+                printf("Saliendo del sistema...\n");
+                break;
+            default:
+                printf("Opcion invalida.\n");
+        }
+
+    } while (opcion != 0);
+
+    EXEC SQL DISCONNECT;
+
+    return EXIT_SUCCESS;
+}
